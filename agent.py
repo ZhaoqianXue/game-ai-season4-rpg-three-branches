@@ -48,6 +48,7 @@ class Resident(NamedTuple):
 
     work: str  # the type of prop this resident works at, such as "stall" (see props.TYPES)
     meet: str  # the building where it spends midday, such as "inn" (see layout.buildings)
+    evening: str = "work"
 
 
 # One row per resident: row 0 is player_1, row 1 is player_2, and so on (player_0 is the visitor).
@@ -60,8 +61,8 @@ RESIDENTS = (
     Resident(work="repair_bench", meet="inn"),
     Resident(work="hearth", meet="inn"),
     Resident(work="bell", meet="inn"),
-    Resident(work="stall", meet="inn"),
-    Resident(work="stall", meet="inn"),
+    Resident(work="stall", meet="inn", evening="pump_0"),
+    Resident(work="stall", meet="inn", evening="pump_0"),
     Resident(work="stall", meet="inn"),
     Resident(work="plot", meet="inn"),
     Resident(work="plot", meet="inn"),
@@ -70,7 +71,28 @@ RESIDENTS = (
 # How a resident reacts when the visitor comes near. "follow" and "avoid" in routines.py are other
 # reactions to try. A reaction lasts REACTION_TICKS ticks before the resident goes back to its day.
 VISITOR_REACTION = "greet"
-REACTION_TICKS = 40
+REACTION_TICKS = 18
+GREETING_COOLDOWN = 120
+MEETING_TICKS = 90
+
+
+class VillageDialogue(dialogue.Dialogue):
+    """Season 4 dialogue is entirely scripted: no model request or external cost."""
+
+    def scripted_answer(self, speaker, text):
+        if not people.is_visitor(speaker):
+            return dialogue.GOOD_DAY_REPLY
+        phase = day.phase(self.latest)
+        if phase == "night":
+            return "Good night. We will talk again in the morning."
+        if "where" in text.lower() or "work" in text.lower():
+            return f"I am {self.persona}. We meet briefly at the inn at midday, then carry on."
+        return {
+            "dawn": "Good morning! I am heading to work; welcome to the village.",
+            "morning": "Hello! Good to see you. I will get back to my work shortly.",
+            "midday": "Welcome! We have a short break at the inn before returning to our jobs.",
+            "evening": "Good evening. The stall keepers meet by the well as the village winds down.",
+        }.get(phase, "Hello! Welcome to Three Branches.")
 
 # The action number of the "use" expression, for noticing when a use did not work.
 USE = action.stand(0.0, "use")["action"]
@@ -81,7 +103,7 @@ class Agent:
 
     def __init__(self) -> None:
         self.memory: dict[str, object] = {}
-        self.dialogue = dialogue.Dialogue("a resident of Three Branches")
+        self.dialogue = VillageDialogue("a resident of Three Branches")
 
     def reset(self, seed: int, observation: ThreeBranchesObservation) -> None:
         """Get ready for a new day: find home, build the route graph, and pick a work prop."""
@@ -114,15 +136,32 @@ class Agent:
             "said_good_day": False,
             # Whether the last action was a use, so the next tick can check that it worked.
             "tried_use": False,
+            "phase": day.phase(observation),
+            "phase_started": day.tick(observation),
+            "last_greeting": -GREETING_COOLDOWN,
+            "visits": 0,
+            "reply_after": {},
         }
+        self.memory["components"] = routing.components(self.memory["graph"])
         self._update_plan(observation)
-        self.dialogue = dialogue.Dialogue(f"a resident of Three Branches who works at the {resident.work}")
+        self.dialogue = VillageDialogue(f"a resident who works at the {resident.work}")
         self.dialogue.observe(observation)
 
     def act(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
         """Choose this tick's action: check the work prop, update the plan, then run the routine."""
         memory = self.memory
         self.dialogue.observe(observation)
+        phase = day.phase(observation)
+        if memory["phase"] != phase:
+            memory.update(phase=phase, phase_started=day.tick(observation))
+            line = {
+                "morning": f"Time for work at the {RESIDENTS[cast(int, memory['slot'])].work}.",
+                "midday": "A short break at the inn, then back to work.",
+                "evening": "Evening already. I am finishing the day's routine.",
+                "night": "Good night, neighbors. I am heading home.",
+            }.get(phase)
+            if line:
+                self.dialogue.say(None, line)
         self._find_free_work_prop(observation)
 
         # A resident reacts to the visitor once per visit, for REACTION_TICKS ticks, then goes back
@@ -150,7 +189,17 @@ class Agent:
 
     def chat(self, inbox: list[dict[str, object]]) -> list[dict[str, str | None]]:
         """Read the messages heard this tick, and return this tick's lines."""
-        self.dialogue.receive(inbox)
+        tick = day.tick(self.dialogue.latest)
+        after = self.memory["reply_after"]
+        accepted = []
+        for message in inbox:
+            speaker = str(message["from"])
+            if people.is_visitor(speaker):
+                if self.memory["phase"] == "night" or tick < after.get(speaker, -1):
+                    continue
+                after[speaker] = tick + 80
+            accepted.append(message)
+        self.dialogue.receive(accepted)
         return self.dialogue.messages()
 
     def _update_plan(self, observation: Mapping[str, object]) -> None:
@@ -159,6 +208,12 @@ class Agent:
         if (routine, goal) == (self.memory["routine"], self.memory["goal"]):
             return
         self.memory.update(routine=routine, goal=goal, plan_started=day.tick(observation))
+        if routine == "greet":
+            repeated = cast(int, self.memory["visits"]) > 0
+            self.memory["visits"] = cast(int, self.memory["visits"]) + 1
+            self.memory["last_greeting"] = day.tick(observation)
+            greeting = "Welcome back!" if repeated else "Hello, visitor!"
+            self.dialogue.say("player_0", f"{greeting} I can stop briefly, then I need to return to my day.")
         # The new routine starts with a clean slate, so, for example, greet waves on every visit.
         cast("dict[str, object]", self.memory["routines"]).pop(routine, None)
 
@@ -216,14 +271,29 @@ def assign(observation: Mapping[str, object], memory: dict[str, object]) -> tupl
         return "sleep_at", memory["home"]
 
     # The visitor is within hearing range and this resident has not reacted yet.
-    if visitor_nearby(observation) and not memory["visitor_handled"]:
+    continuing = memory.get("routine") == "greet" and _plan_age(observation, memory) < REACTION_TICKS
+    cooled = day.tick(observation) - cast(int, memory.get("last_greeting", -GREETING_COOLDOWN)) >= GREETING_COOLDOWN
+    if visitor_nearby(observation) and not memory["visitor_handled"] and (continuing or cooled):
         return VISITOR_REACTION, "player_0"
 
     if phase == "dawn":
         return "go_to", work_prop
 
     if phase == "midday":
-        return "gather_at", resident.meet
+        # Arrivals differ by resident, and the meeting cannot swallow the whole day.
+        elapsed = day.tick(observation) - cast(int, memory.get("phase_started", day.tick(observation)))
+        delay = cast(int, memory["slot"]) * 3
+        if elapsed < delay:
+            return "tend", work_prop
+        if elapsed < delay + MEETING_TICKS:
+            return "gather_at", resident.meet
+        return "tend", work_prop
+
+    if phase == "evening" and resident.evening != "work":
+        elapsed = day.tick(observation) - cast(int, memory.get("phase_started", day.tick(observation)))
+        if elapsed < MEETING_TICKS:
+            return "gather_at", resident.evening
+        return "go_to", memory["home"]
 
     # Morning and evening are for work. Seasons with day and night turned off report a single
     # "day" phase, which is all work too.

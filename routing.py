@@ -20,6 +20,23 @@ Cell = tuple[int, int]
 Graph = dict[Cell, tuple[tuple[Cell, float], ...]]
 
 
+def components(graph: Graph) -> dict[Cell, int]:
+    """Label connected walkable regions once, so a prop cannot select an isolated approach."""
+    labels = {}
+    for cell in graph:
+        if cell in labels:
+            continue
+        label = len(labels)
+        labels[cell] = label
+        pending = [cell]
+        for current in pending:
+            for neighbor, _ in graph[current]:
+                if neighbor not in labels:
+                    labels[neighbor] = label
+                    pending.append(neighbor)
+    return labels
+
+
 def build_graph(observation: Mapping[str, object]) -> Graph:
     """Build a graph of the whole village: one node per walkable cell, one edge per legal step.
 
@@ -50,7 +67,7 @@ def build_graph(observation: Mapping[str, object]) -> Graph:
     return {cell: tuple(steps) for cell, steps in edges.items()}
 
 
-def path(graph: Graph, start: Cell, end: Cell) -> list[Cell] | None:
+def path(graph: Graph, start: Cell, end: Cell, crowded: set[Cell] | None = None) -> list[Cell] | None:
     """Return the cheapest path from ``start`` to ``end``, both included, or ``None`` when there is none.
 
     A* explores cells in order of the cost so far plus a guess of the cost still to go. The guess
@@ -76,7 +93,7 @@ def path(graph: Graph, start: Cell, end: Cell) -> list[Cell] | None:
         if cost != costs[cell]:
             continue
         for neighbor, step_cost in graph[cell]:
-            candidate = cost + step_cost
+            candidate = cost + step_cost + (8.0 if crowded and neighbor in crowded else 0.0)
             if candidate >= costs.get(neighbor, float("inf")):
                 continue
             costs[neighbor] = candidate

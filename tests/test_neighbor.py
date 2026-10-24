@@ -87,10 +87,12 @@ def test_residents_find_their_own_work_props_and_follow_the_day(scene, monkeypat
         ("dawn", ("go_to", memory["work_prop"])),
         ("morning", ("tend", memory["work_prop"])),
         ("midday", ("gather_at", "inn")),
-        ("evening", ("tend", memory["work_prop"])),
+        ("evening", ("gather_at", "pump_0")),
         ("night", ("sleep_at", memory["home"])),
     ):
         observation["phase"] = phase
+        # At midday the revised village staggers departures by slot*3 ticks.
+        memory["phase_started"] = observation["tick"] - (20 if phase == "midday" else 0)
         assert agent.assign(observation, memory) == plan
 
     observation["phase"] = "morning"
@@ -132,7 +134,7 @@ def test_visitor_reaction_lasts_its_window_and_repeats_on_the_next_visit(scene, 
     wave = action.stand(0.0, "wave")["action"]
     example.memory.update(routine=None, goal=None)
     assert run(100)[0] == "tend"
-    for arrival in (101, 200):
+    for arrival in (101, 260):
         heard[:] = [_visitor_at(me.position(observation))]
         assert run(arrival) == ("greet", wave)
         assert run(arrival + agent.REACTION_TICKS - 1)[0] == "greet"
@@ -221,7 +223,7 @@ def test_go_to_replans_after_a_stalled_position(scene, monkeypatch):
     routes = iter(([start, east, destination], [start, north, (1, 1), (2, 1), destination]))
     calls = []
 
-    def reroute(_graph, route_start, route_destination):
+    def reroute(_graph, route_start, route_destination, crowded=None):
         calls.append((route_start, route_destination))
         return list(next(routes))
 
@@ -375,8 +377,10 @@ def test_seeded_season_five_day_moves_works_and_sleeps_with_legal_actions():
             ):
                 moved.add(player)
         for player in commanded_use:
-            assert observations[player]["self"]["expression"]["type"] == "use"
-            use_phases[player].add(phases[player])
+            # Crowded, staggered schedules can contend for the same prop. Count
+            # actual successes, not merely requested uses; the next tick retries.
+            if observations[player]["self"]["expression"]["type"] == "use":
+                use_phases[player].add(phases[player])
         for player in commanded_sleep:
             order = agent.routines.sleep_at(
                 observations[player], residents[player].memory, residents[player].memory["home"]
@@ -387,6 +391,7 @@ def test_seeded_season_five_day_moves_works_and_sleeps_with_legal_actions():
     expected = set(residents)
     assert ticks == 1200
     assert moved == expected
+    assert all(use_phases.values()), "Every resident must actually use a work prop."
     assert {"morning", "evening"} <= {phase for phases in use_phases.values() for phase in phases}
     assert slept == expected
     assert all(
